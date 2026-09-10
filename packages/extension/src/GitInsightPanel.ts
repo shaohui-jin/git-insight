@@ -446,51 +446,6 @@ export class GitInsightPanel {
       return;
     }
 
-    if (req.type === "applyResolve") {
-      const push = req.push !== false;
-      const cleanTemp = !req.files?.length;
-      const pick = await vscode.window.showWarningMessage(
-        cleanTemp
-          ? `将推送临时分支（独立 worktree，不切换当前分支）：\n` +
-              `1) 基于「${req.into}」新建临时分支\n` +
-              `2) 合并「${req.from}」并提交\n` +
-              (push ? `3) 推送到 origin\n` : "") +
-              `\n完成后可在面板「一键申请 MR」。`
-          : `将解决冲突并${push ? "推送" : "提交"}（独立 worktree，不切换当前分支）：\n` +
-              `1) 基于「${req.into}」新建临时分支\n` +
-              `2) 合并「${req.from}」并写入选边结果\n` +
-              (push ? `3) 推送到 origin\n` : "") +
-              `\n完成后可在面板「一键申请 MR」。`,
-        { modal: true },
-        "继续",
-      );
-      if (pick !== "继续") {
-        await this.post({
-          type: "error",
-          message: cleanTemp ? "已取消推送临时分支" : "已取消一键解决",
-          code: "CANCELLED",
-        });
-        return;
-      }
-    }
-
-    if (req.type === "createMr") {
-      const people =
-        req.reviewers?.length
-          ? `\n指派人 / 审核人：${req.reviewers.join(", ")}`
-          : "\n指派人 / 审核人：（未指定）";
-      const pick = await vscode.window.showWarningMessage(
-        `将按「Git 配置」中的方式创建 ${req.sourceBranch} → ${req.targetBranch} 的 MR/PR。` +
-          people,
-        { modal: true },
-        "创建",
-      );
-      if (pick !== "创建") {
-        await this.post({ type: "error", message: "已取消创建 MR", code: "CANCELLED" });
-        return;
-      }
-    }
-
     const label = busyLabelForRequest(req);
 
     if (label) {
@@ -542,6 +497,21 @@ export class GitInsightPanel {
               (msg.pushed ? "（已推送）" : "（未推送）") +
               stay +
               "\n可在面板点击「一键申请 MR」。",
+          );
+        }
+        if (msg.type === "batchMergeRunResult") {
+          const detail = msg.data.pushed
+            ? `已推送 ${msg.data.remote}/${msg.data.batchBranch}`
+            : `推送失败，本地批量分支已保留：${msg.data.pushError ?? ""}`;
+          void vscode.window.showInformationMessage(
+            `批量合并完成：${msg.data.batchBranch} @ ${msg.data.commitSha.slice(0, 7)}\n` +
+              `${detail}\n下一步：回矩阵「一键申请 MR」。`,
+          );
+        }
+        if (msg.type === "batchMrPrecheckResult" && !msg.data.clean) {
+          void vscode.window.showWarningMessage(
+            `MR 前终检发现冲突：目标 ${msg.data.into} 在批量期间被推进，` +
+              `与批量分支存在 ${msg.data.conflictPaths.length} 个冲突文件，请确认后谨慎继续。`,
           );
         }
         if (msg.type === "createMrResult" && msg.url) {

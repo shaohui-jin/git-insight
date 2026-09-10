@@ -1,14 +1,19 @@
 import {
   applyStashedResolve,
   buildBranchGraph,
+  buildResolversFromTemplates,
   createMergeRequest,
   crossPairs,
+  deleteLocalBranches,
   detectMrPlatform,
   fetchRemote,
   listRemotes,
   normalizeRemoteWebUrl,
+  planBatchMerge,
+  precheckBatchMr,
   prepareCreateMr,
   probePlatform,
+  pushBranch,
   rehearseMerge,
   reportFetch,
   reportGraph,
@@ -16,16 +21,19 @@ import {
   reportMergeRehearsal,
   reportMergeSurvey,
   resolveDefaultRemote,
+  resolveRepoRoot,
+  resolverTemplateMeta,
+  runBatchMerge,
+  runGit,
   suggestMergeOrder,
   surveyMerges,
-  resolveRepoRoot,
-  runGit,
   graphToMermaid,
   mergeToMermaid,
   titleSideStatus,
   validateGithubToken,
   validateGitlabToken,
   GitError,
+  type BatchRunItem,
   type TokenPlatform,
   type TokenValidateResult,
 } from "@shaohui_jin/git-insight-core";
@@ -358,6 +366,16 @@ export function busyLabelForRequest(req: WebviewRequest): string | undefined {
       return "推演合并顺序中…";
     case "applyResolve":
       return req.files?.length ? "一键解决并推送…" : "正在推送临时分支…";
+    case "batchMergePlan":
+      return "批量干跑预演中…";
+    case "batchMergeRun":
+      return "批量合并并推送中…";
+    case "pushBranch":
+      return "推送分支中…";
+    case "batchMrPrecheck":
+      return "MR 前终检中…";
+    case "deleteLocalBranches":
+      return undefined;
     case "prepareCreateMr":
       return "准备申请 MR（识别平台 / 拉取成员）…";
     case "createMr":
@@ -384,6 +402,10 @@ export function requestStreamsProgress(req: WebviewRequest): boolean {
     case "survey":
     case "mergeOrder":
     case "applyResolve":
+    case "batchMergePlan":
+    case "batchMergeRun":
+    case "pushBranch":
+    case "batchMrPrecheck":
     case "downloadCli":
     case "validateToken":
       return true;
@@ -465,6 +487,8 @@ export async function handleWebviewRequest(
           type: "gitConfigResult",
           config: cfg,
           cliStatus,
+          // readonly 需展开为普通数组，避免 webview postMessage 结构化克隆问题
+          templates: [...resolverTemplateMeta],
           configPath: cfgPath(),
           methodReady: ready.ok,
           methodReadyReason: ready.reason,
@@ -599,6 +623,7 @@ export async function handleWebviewRequest(
           type: "gitConfigResult",
           config: cfg,
           cliStatus,
+          templates: [...resolverTemplateMeta],
           configPath: cfgPath(),
           methodReady: ready.ok,
           methodReadyReason: ready.reason,
@@ -619,6 +644,8 @@ export async function handleWebviewRequest(
       aiApiBaseUrl: req.config.aiApiBaseUrl ?? prev.aiApiBaseUrl ?? "",
       aiApiKey: req.config.aiApiKey ?? prev.aiApiKey ?? "",
       aiModel: req.config.aiModel ?? prev.aiModel ?? "",
+      autoResolveEnabled: req.config.autoResolveEnabled ?? prev.autoResolveEnabled ?? false,
+      autoResolveTemplates: req.config.autoResolveTemplates ?? prev.autoResolveTemplates ?? [],
     });
     const cliStatus = cwd
       ? await buildCliStatusCached(cwd, cliStorageDir, saved.defaultRemote)
@@ -630,6 +657,7 @@ export async function handleWebviewRequest(
           type: "gitConfigResult",
           config: saved,
           cliStatus,
+          templates: [...resolverTemplateMeta],
           configPath: cfgPath(),
           methodReady: ready.ok,
           methodReadyReason: ready.reason,
@@ -800,6 +828,12 @@ export async function handleWebviewRequest(
       }
       // files 可为空：干净合并（如同名 master→origin/master）仅推临时分支
       const remote = await resolveOpRemote(cwd, req.remote, loadCfg);
+      // 冲突自动解决：总开关开启时，把用户勾选的模板编译为 resolver 注入（内置 union 永远在内）
+      const cfg = await loadCfg();
+      const resolvers =
+        cfg.autoResolveEnabled && (cfg.autoResolveTemplates ?? []).length > 0
+          ? buildResolversFromTemplates(cfg.autoResolveTemplates ?? [])
+          : undefined;
       const data = await applyStashedResolve({
         cwd,
         into: req.into,
@@ -807,7 +841,9 @@ export async function handleWebviewRequest(
         files: req.files ?? [],
         remote,
         push: req.push,
+        keepLocal: req.keepLocal,
         tempBranch: req.tempBranch,
+        resolvers,
         onProgress,
       });
       return {
@@ -827,6 +863,180 @@ export async function handleWebviewRequest(
             usedWorktree: data.usedWorktree,
           },
           await workspacePayload(cwd, previewMode),
+        ],
+      };
+    }
+
+    if (req.type === "batchMergePlan") {
+      if (previewMode) {
+        return {
+          messages: [
+            {
+              type: "error",
+              message: "预览模式不支持批量合并，请在扩展中打开真实仓库后操作",
+              code: "PREVIEW_READONLY",
+            },
+          ],
+        };
+      }
+      const entries = (req.entries ?? []).filter((e) => e.from?.trim());
+      if (!req.into || entries.length === 0) {
+        return {
+          messages: [
+            {
+              type: "error",
+              message: "批量合并需要线上目标与至少一个分支",
+              code: "USAGE",
+            },
+          ],
+        };
+      }
+      const remote = await resolveOpRemote(cwd, req.remote, loadCfg);
+      const data = await planBatchMerge({
+        cwd,
+        into: req.into,
+        entries,
+        fetch: !req.noFetch,
+        remote,
+        onProgress,
+      });
+      return {
+        messages: [{ type: "batchMergePlanResult", data }],
+      };
+    }
+
+    if (req.type === "batchMergeRun") {
+      if (previewMode) {
+        return {
+          messages: [
+            {
+              type: "error",
+              message: "预览模式不支持批量合并，请在扩展中打开真实仓库后操作",
+              code: "PREVIEW_READONLY",
+            },
+          ],
+        };
+      }
+      const items = (req.items ?? []).filter(
+        (i): i is BatchRunItem => !!i && !!i.from && !!i.source && !!i.sourceSha,
+      );
+      if (!req.into || !req.batchBranch || items.length === 0) {
+        return {
+          messages: [
+            {
+              type: "error",
+              message: "批量合并缺少目标 / 批量分支 / 清单",
+              code: "USAGE",
+            },
+          ],
+        };
+      }
+      const remote = await resolveOpRemote(cwd, req.remote, loadCfg);
+      const data = await runBatchMerge({
+        cwd,
+        into: req.into,
+        batchBranch: req.batchBranch,
+        items,
+        fetch: !req.noFetch,
+        remote,
+        onProgress,
+      });
+      return {
+        messages: [
+          { type: "batchMergeRunResult", data },
+          await workspacePayload(cwd, previewMode),
+        ],
+      };
+    }
+
+    if (req.type === "pushBranch") {
+      if (previewMode) {
+        return {
+          messages: [
+            {
+              type: "error",
+              message: "预览模式不支持推送，请在扩展中打开真实仓库后操作",
+              code: "PREVIEW_READONLY",
+            },
+          ],
+        };
+      }
+      if (!req.branch?.trim()) {
+        return {
+          messages: [
+            { type: "error", message: "缺少分支名", code: "USAGE" },
+          ],
+        };
+      }
+      const remote = await resolveOpRemote(cwd, req.remote, loadCfg);
+      const data = await pushBranch({
+        cwd,
+        branch: req.branch,
+        remote,
+        onProgress,
+      });
+      return {
+        messages: [
+          {
+            type: "pushBranchResult",
+            branch: data.branch,
+            remote: data.remote,
+            sha: data.sha,
+          },
+        ],
+      };
+    }
+
+    if (req.type === "batchMrPrecheck") {
+      if (!req.into || !req.batchBranch) {
+        return {
+          messages: [
+            { type: "error", message: "终检缺少目标 / 批量分支", code: "USAGE" },
+          ],
+        };
+      }
+      const remote = await resolveOpRemote(cwd, req.remote, loadCfg);
+      const data = await precheckBatchMr({
+        cwd,
+        into: req.into,
+        batchBranch: req.batchBranch,
+        remote,
+        fetch: true,
+        onProgress,
+      });
+      return {
+        messages: [{ type: "batchMrPrecheckResult", data }],
+      };
+    }
+
+    if (req.type === "deleteLocalBranches") {
+      if (previewMode) {
+        return {
+          messages: [
+            {
+              type: "error",
+              message: "预览模式不支持删除分支",
+              code: "PREVIEW_READONLY",
+            },
+          ],
+        };
+      }
+      const branches = (req.branches ?? []).map((b) => b.trim()).filter(Boolean);
+      if (branches.length === 0) {
+        return {
+          messages: [
+            { type: "error", message: "没有待删除的分支", code: "USAGE" },
+          ],
+        };
+      }
+      const data = await deleteLocalBranches({ cwd, branches });
+      return {
+        messages: [
+          {
+            type: "deleteLocalBranchesResult",
+            deleted: data.deleted,
+            failed: data.failed,
+          },
         ],
       };
     }
@@ -870,6 +1080,7 @@ export async function handleWebviewRequest(
           type: "gitConfigResult",
           config: saved,
           cliStatus,
+          templates: [...resolverTemplateMeta],
           configPath: cfgPath(),
           methodReady: ready.ok,
           methodReadyReason: ready.reason,
@@ -918,6 +1129,7 @@ export async function handleWebviewRequest(
             type: "gitConfigResult",
             config,
             cliStatus,
+            templates: [...resolverTemplateMeta],
             configPath: cfgPath(),
             methodReady: ready.ok,
             methodReadyReason: ready.reason,

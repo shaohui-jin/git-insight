@@ -106,10 +106,36 @@ export type {
   StashFilePayload,
 } from "./merge/applyResolve.js";
 export {
+  batchBranchName,
+  deleteLocalBranches,
+  planBatchMerge,
+  precheckBatchMr,
+  pushBranch,
+  runBatchMerge,
+} from "./merge/batchMerge.js";
+export type {
+  BatchMergeEntry,
+  BatchMergePlanOptions,
+  BatchMergePlanResult,
+  BatchMergeRunOptions,
+  BatchMergeRunResult,
+  BatchPlanItem,
+  BatchPlanStep,
+  BatchRunItem,
+  BatchRunStep,
+  BatchSourceKind,
+  BatchStepOutcome,
+  BatchMrPrecheckResult,
+  DeleteBranchesResult,
+  PushBranchResult,
+} from "./merge/batchMerge.js";
+export {
   autoResolveConflicts,
+  buildResolversFromTemplates,
   builtinResolvers,
   readThreeWay,
   regenerate,
+  resolverTemplateMeta,
   takeOurs,
   takeTheirs,
   union,
@@ -118,6 +144,7 @@ export type {
   AutoResolveOutcome,
   ConflictResolver,
   ResolveContext,
+  ResolverTemplateMeta,
 } from "./merge/resolvers.js";
 export {
   branchNameForMr,
