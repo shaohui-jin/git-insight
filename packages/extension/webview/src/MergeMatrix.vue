@@ -1,0 +1,952 @@
+<script setup lang="ts">
+/**
+ * 矩阵预演：一屏看清「这批分支两两合起来会怎样」，以及「按什么顺序合最省事」。
+ *
+ * 属图纸层：网格底、等宽字、硬边。格子只显示结论 + 冲突文件数，
+ * 正文要看时点开右侧详情——批量场景不生成冲突正文，点「去预演」才走单对完整流程。
+ */
+import { computed, ref, watch } from "vue";
+import BranchTreeSelect from "./BranchTreeSelect.vue";
+import type {
+  BatchMergeRunResult,
+  MergeSurveyCell,
+  MergeSurveyResult,
+  PairProgress,
+  SuggestOrderResult,
+  SurveyOutcome,
+} from "./types";
+import type { BranchOption } from "./graph/branchTree";
+
+const props = defineProps<{
+  branches: BranchOption[];
+  survey: MergeSurveyResult | null;
+  order: SuggestOrderResult | null;
+  busy: boolean;
+  /** 每一对走到哪了（已推临时分支 / 已提 MR）；用来把进度标回格子上 */
+  progress: PairProgress[];
+  /** 批量合并结果；非 null 时顶部展示横幅（一键申请 MR / 重推 / 清理） */
+  batchResult: BatchMergeRunResult | null;
+}>();
+
+const emit = defineEmits<{
+  (e: "survey", payload: { intos: string[]; froms: string[] }): void;
+  (e: "order", payload: { into: string; branches: string[] }): void;
+  (
+    e: "goPreview",
+    payload: {
+      into: string;
+      from: string;
+      /** 整批待办，让预演页能显示「第几 / 共几」并支持上一条下一条 */
+      queue: Array<{ into: string; from: string }>;
+    },
+  ): void;
+  /** 对某一格直接申请 MR，不用绕回预演页；带上 sha 好记住这一格的进度 */
+  (
+    e: "createMr",
+    payload: {
+      into: string;
+      from: string;
+      intoSha: string;
+      fromSha: string;
+      /** 由矩阵定死，见 createMrFor */
+      sourceBranch?: string;
+    },
+  ): void;
+  (e: "openUrl", url: string): void;
+  /** 点「一键处理合并并推送」：把当前矩阵的合入顺序（含建议排序）交给 App 去干跑 */
+  (e: "batchMerge", payload: { into: string; froms: string[] }): void;
+  /** 批量成功后用批量分支申请单个总 MR */
+  (e: "batchMr", payload: { into: string; batchBranch: string }): void;
+  /** push 失败后的「重推」 */
+  (e: "batchPush", payload: { into: string; batchBranch: string }): void;
+  /** 批量成功后清理参与合并的本地临时分支 */
+  (e: "batchCleanup", payload: { into: string; branches: string[] }): void;
+}>();
+
+const intos = ref<string[]>([]);
+const froms = ref<string[]>([]);
+const picking = ref<"into" | "from">("into");
+/**
+ * 下拉直接读写 intos / froms：单一数据源。
+ * chips（tag）和 multi 面板勾选天然同源——删 tag、面板里取消勾选后确认，
+ * 两边都不会再出现「并集复活」的偏差。
+ */
+const pickValue = computed({
+  get: () => (picking.value === "into" ? intos.value : froms.value),
+  set: (v: string[]) => {
+    if (picking.value === "into") {
+      intos.value = v;
+    } else {
+      froms.value = v;
+    }
+  },
+});
+const activeCell = ref<MergeSurveyCell | null>(null);
+
+const OUTCOME_TEXT: Record<SurveyOutcome, string> = {
+  clean: "干净",
+  conflicts: "冲突",
+  unrelated: "无共祖",
+  same: "同名",
+  error: "失败",
+};
+
+/**
+ * BranchTreeSelect multi 模式 confirm。
+ * values 是面板勾选的完整状态（含取消勾选的减量），必须全量对齐，
+ * 不能做增量合并——否则面板里取消的分支会被旧值「复活」。
+ * 允许清空：确认什么都没勾，就是全删。
+ */
+function onPickedConfirm(values: string[]): void {
+  const bucket = picking.value === "into" ? intos : froms;
+  bucket.value = [...values];
+}
+
+/** 删 tag 即改数据源；下拉勾选读同一份，无需手动同步 */
+function drop(kind: "into" | "from", name: string): void {
+  const bucket = kind === "into" ? intos : froms;
+  bucket.value = bucket.value.filter((b) => b !== name);
+}
+
+const canRun = computed(
+  () => !props.busy && intos.value.length > 0 && froms.value.length > 0,
+);
+const canOrder = computed(
+  () => !props.busy && intos.value.length === 1 && froms.value.length > 1,
+);
+
+function runSurvey(): void {
+  if (!canRun.value) {
+    return;
+  }
+  emit("survey", { intos: [...intos.value], froms: [...froms.value] });
+}
+
+function runOrder(): void {
+  const into = intos.value[0];
+  if (!canOrder.value || !into) {
+    return;
+  }
+  emit("order", { into, branches: [...froms.value] });
+}
+
+function pairKey(intoRef: string, fromRef: string): string {
+  return `${intoRef}\u0000${fromRef}`;
+}
+
+/** 表格按结果里的行列渲染，而不是当前选择 —— 改了选择但没重跑时，表格仍对应旧结果 */
+const resultIntos = computed(() => [
+  ...new Set((props.survey?.cells ?? []).map((c) => c.into)),
+]);
+
+const rows = computed(() => {
+  const cells = props.survey?.cells ?? [];
+  const index = new Map(cells.map((c) => [pairKey(c.into, c.from), c]));
+  const resultFroms = [...new Set(cells.map((c) => c.from))];
+  return resultFroms.map((from) => ({
+    from,
+    cells: resultIntos.value.map((into) => ({
+      into,
+      cell: index.get(pairKey(into, from)) ?? null,
+    })),
+  }));
+});
+
+/**
+ * 算顺序结果是否对得上当前矩阵：单 into 且分支集合一致。
+ * 对不上（换过选择没重跑矩阵）就忽略排序保持原序，别张冠李戴。
+ */
+const orderMatches = computed(() => {
+  const o = props.order;
+  if (!o || resultIntos.value.length !== 1) {
+    return false;
+  }
+  if (!sameRef(o.best.into, resultIntos.value[0])) {
+    return false;
+  }
+  const matrixFroms = rows.value.map((r) => r.from);
+  const orderFroms = new Set(o.best.order);
+  return (
+    matrixFroms.length === orderFroms.size &&
+    matrixFroms.every((f) => [...orderFroms].some((n) => sameRef(n, f)))
+  );
+});
+
+/** into/from 两侧可能带 refs// 或 origin/ 前缀差异，比较/对齐时归一化 */
+function stripRef(r: string): string {
+  return r.replace(/^refs\/(heads|remotes)\//, "").replace(/^origin\//, "");
+}
+
+function sameRef(a: string, b: string): boolean {
+  return stripRef(a) === stripRef(b);
+}
+
+type MatrixRow = {
+  from: string;
+  cells: Array<{ into: string; cell: MergeSurveyCell | null }>;
+};
+
+type DisplayRow =
+  | ({ kind: "row"; ord: number } & MatrixRow)
+  | { kind: "divider"; reason: string };
+
+/** 算完顺序后矩阵默认按建议顺序展示；切「原顺序」则去掉序号与分隔线 */
+const orderView = ref<"best" | "original">("best");
+watch(
+  () => props.order,
+  () => {
+    orderView.value = "best";
+  },
+);
+
+/**
+ * 渲染用的行序：建议顺序生效时按 order 重排、加序号，
+ * 并在连续干净前缀之后插入「以下需要人工处理」分隔行（对应 blockedAt）。
+ */
+const displayRows = computed<DisplayRow[]>(() => {
+  const base = rows.value;
+  const asPlain = (): DisplayRow[] =>
+    base.map((row) => ({ kind: "row", ord: 0, ...row }));
+  const o = props.order;
+  if (!o || orderView.value !== "best" || !orderMatches.value) {
+    return asPlain();
+  }
+  // order 里的名字是「算顺序」当时的选择，可能与矩阵行的 from 前缀形态不同
+  //（本地树 vs 远程树选出来的 ref 写法不一样），按归一化形态对齐，别精确匹配
+  const byFrom = new Map(base.map((row) => [stripRef(row.from), row]));
+  const out: DisplayRow[] = [];
+  o.best.order.forEach((name, idx) => {
+    const row = byFrom.get(stripRef(name));
+    if (!row) {
+      return;
+    }
+    out.push({ kind: "row", ord: idx + 1, ...row });
+    const prefix = o.best.cleanPrefix;
+    if (idx + 1 === prefix && prefix < o.best.order.length) {
+      out.push({
+        kind: "divider",
+        reason:
+          o.best.blockedReason ??
+          (o.best.blockedAt ? `从 ${o.best.blockedAt} 起需要人工处理` : ""),
+      });
+    }
+  });
+  // 防御：from 形态对不上导致行丢失时回退原序
+  return out.length === base.length ? out : asPlain();
+});
+
+const progressIndex = computed(
+  () => new Map(props.progress.map((p) => [pairKey(p.into, p.from), p])),
+);
+
+/**
+ * 这一格的进度记录。
+ *
+ * 注意「已处理」不等于「现在合得进去」：一键解决产出的是临时分支，
+ * from 本身没动，重跑 merge-tree 照样冲突。所以这是一个独立状态，
+ * 只有两侧 sha 与当时一致才算数——sha 变了那条临时分支就落后了。
+ *
+ * 只是本次会话的记账，不是「有没有解决过」的唯一依据，见 tempBranchFor。
+ */
+function progressFor(cell: MergeSurveyCell): PairProgress | undefined {
+  const hit = progressIndex.value.get(pairKey(cell.into, cell.from));
+  return hit && hit.intoSha === cell.intoSha && hit.fromSha === cell.fromSha
+    ? hit
+    : undefined;
+}
+
+/**
+ * 一格在整条链路上走到哪了。两条路径汇到同一个终点：
+ *
+ *   冲突 → 已处理（临时分支已推）→ 已提 MR
+ *   干净 ────────────────────────→ 已提 MR
+ *
+ * browser 方式只是打开创建页，提没提我们看不见，所以单列一档，
+ * 既不当没做（别再催），也不谎称已提交。
+ */
+type Stage = "open" | "ready" | "local" | "resolved" | "page" | "mr";
+
+interface TempBranchInfo {
+  name: string;
+  pushed: boolean;
+  /** 本次会话刚产出、且两侧 sha 与当时一致，才敢说它是新鲜的 */
+  fresh: boolean;
+}
+
+/**
+ * 这一对的临时分支：先认本次会话的记录，没有就退回 git 里查到的。
+ *
+ * 光认内存记录是不够的——它挨不过面板重建、推送失败和 ref 移动导致的作废，
+ * 于是「上次已经解决过」和「从没碰过」在矩阵里长得一模一样。分支存不存在
+ * 则是可查的事实。代价是查到的分支不知道是基于哪个提交建的，所以标 fresh
+ * 区分开，别让人以为它一定跟得上当前两侧。
+ *
+ * 只有冲突格子认这条兜底。干净格子压根不需要临时分支（直接拿 from 提 MR），
+ * 仓库里恰好躺着一条同名 `merge/*`——多半是早先试出来的——不该改变它的档位，
+ * 更不该把它推进「未推送」这种走不下去的档。
+ */
+function tempBranchFor(cell: MergeSurveyCell): TempBranchInfo | undefined {
+  const rec = progressFor(cell);
+  if (rec?.tempBranch) {
+    // 矩阵模式下解决的产物只在本地（keepLocal），推送收敛到批量流程；
+    // 旧记录（单预演页推过）才标 pushed
+    const keptLocal = !!rec.keptLocal;
+    return { name: rec.tempBranch, pushed: !keptLocal, fresh: true };
+  }
+  if (cell.outcome !== "conflicts" || !cell.tempBranch) {
+    return undefined;
+  }
+  return { name: cell.tempBranch.name, pushed: cell.tempBranch.remote, fresh: false };
+}
+
+function stageOf(cell: MergeSurveyCell): Stage {
+  const mr = progressFor(cell)?.mr;
+  if (mr) {
+    return mr.via === "browser" ? "page" : "mr";
+  }
+  const temp = tempBranchFor(cell);
+  if (temp) {
+    // local（只在本地）与 resolved（已推）都是「已解决」档：批量资格同权，
+    // 子标签区分「本地 / 已推送」。矩阵模式下解决不推送，local 是常态而非异常
+    return temp.pushed ? "resolved" : "local";
+  }
+  return cell.outcome === "clean" ? "ready" : "open";
+}
+
+/** 空串表示「照常显示 outcome」——open / ready 两档本来就该显示「冲突」「干净」 */
+const STAGE_TEXT: Record<Stage, string> = {
+  open: "",
+  ready: "",
+  local: "已解决·本地",
+  resolved: "已处理",
+  page: "已开创建页",
+  mr: "已提 MR",
+};
+
+/** 只有真正走过链路的三档才改格子配色；open / ready 保持 outcome 本来的样子 */
+function stageClass(cell: MergeSurveyCell): string {
+  const stage = stageOf(cell);
+  return STAGE_TEXT[stage] ? `is-${stage}` : "";
+}
+
+/** ✓ = 已处理待提 MR，↗ = 已经提过了，! = 只在本地还没推 */
+function stageMark(cell: MergeSurveyCell): string {
+  const stage = stageOf(cell);
+  if (!STAGE_TEXT[stage]) {
+    return "";
+  }
+  if (stage === "local") {
+    return "!";
+  }
+  return stage === "resolved" ? "✓" : "↗";
+}
+
+/** 表格里所有格子，按展示顺序排平——建议顺序生效时，逐条处理/MR 队列自动跟随 */
+const allCells = computed(() =>
+  displayRows.value.flatMap((r) =>
+    r.kind === "divider"
+      ? []
+      : r.cells.map((c) => c.cell).filter((cell): cell is MergeSurveyCell => !!cell),
+  ),
+);
+
+function toPairs(cells: MergeSurveyCell[]): Array<{ into: string; from: string }> {
+  return cells.map((c) => ({ into: c.into, from: c.from }));
+}
+
+/** 逐条处理只管冲突格子：干净的没什么可解决的 */
+const conflictCells = computed(() =>
+  allCells.value.filter((c) => c.outcome === "conflicts"),
+);
+
+/** 队列一律按 stageOf 分档，跟格子上显示的状态同源，免得计数和格子对不上 */
+const conflictQueue = computed(() => toPairs(conflictCells.value));
+
+/** 还没解决的；解决了但只在本地不再算 pending（批量资格 local 与 resolved 同权） */
+function stillPending(cell: MergeSurveyCell): boolean {
+  const stage = stageOf(cell);
+  return stage === "open";
+}
+
+const pendingQueue = computed(() => toPairs(conflictCells.value.filter(stillPending)));
+
+/**
+ * 还没提过 MR、现在就能提的格子；批处理的最后一段。
+ *
+ * 冲突走完解决拿到临时分支（local / resolved 都算：本地分支批量流程会带上它），
+ * 干净的本来就能直接提（ready），两条路径在这里合流。
+ */
+const mrCells = computed(() =>
+  allCells.value.filter((c) => {
+    const stage = stageOf(c);
+    return stage === "resolved" || stage === "local" || stage === "ready";
+  }),
+);
+
+const mrQueue = computed(() => toPairs(mrCells.value));
+
+const doneCount = computed(
+  () => conflictCells.value.filter((c) => !stillPending(c)).length,
+);
+/** 实际提过 MR 的格子数，干净的和冲突的一起算 */
+const mrDoneCount = computed(
+  () => allCells.value.filter((c) => ["mr", "page"].includes(stageOf(c))).length,
+);
+
+function cellTitle(cell: MergeSurveyCell): string {
+  const stage = stageOf(cell);
+  if (stage === "open" || stage === "ready") {
+    return cell.error || `${cell.from} → ${cell.into}`;
+  }
+  const temp = tempBranchFor(cell);
+  const source = temp ? `临时分支 ${temp.name}` : `直接用 ${cell.from}`;
+  const note =
+    stage === "local"
+      ? "已解决，保留在本地；批量合并时会自动带上，或先补推送再单独提 MR"
+      : stage === "resolved"
+        ? "还没申请 MR"
+        : stage === "page"
+          ? "创建页已打开，请确认是否已提交"
+          : `MR：${progressFor(cell)?.mr?.url ?? "已创建"}`;
+  return `${source} · ${note}`;
+}
+
+/**
+ * 发起批量：把参与格子的 from 按当前展示序（含建议排序）交出去。
+ * 已提 MR / 开过创建页的格子不进批量；能否发起由 canBatch 兜底。
+ */
+function startBatch(): void {
+  if (!canBatch.value) {
+    return;
+  }
+  const froms = allCells.value
+    .filter((c) => !["mr", "page"].includes(stageOf(c)))
+    .map((c) => c.from);
+  if (froms.length > 0) {
+    emit("batchMerge", { into: batchInto.value, froms });
+  }
+}
+
+function goPreview(pair: { into: string; from: string }): void {
+  emit("goPreview", { ...pair, queue: conflictQueue.value });
+}
+
+/**
+ * 源分支这里就定死，不交给 core 去猜。
+ *
+ * core 猜不到的是「这一格是干净直合还是解决过冲突」：它只会按 (into, from)
+ * 算出临时分支名，存在就用。仓库里躺着一条早先试出来的同名 `merge/*` 时，
+ * 一个说好了「直接用 from」的干净格子会被悄悄换成那条陈旧分支去提 MR。
+ */
+function createMrFor(cell: MergeSurveyCell): void {
+  emit("createMr", {
+    into: cell.into,
+    from: cell.from,
+    intoSha: cell.intoSha,
+    fromSha: cell.fromSha,
+    sourceBranch: stageOf(cell) === "ready" ? cell.from : tempBranchFor(cell)?.name,
+  });
+}
+
+/** 批处理的下一步：先把冲突全解决，再从上往下逐条申请 MR */
+function nextAction(): void {
+  const pending = pendingQueue.value[0];
+  if (pending) {
+    goPreview(pending);
+    return;
+  }
+  const needsMr = mrCells.value[0];
+  if (needsMr) {
+    createMrFor(needsMr);
+  }
+}
+
+const nextActionText = computed(() => {
+  if (pendingQueue.value.length > 0) {
+    return doneCount.value > 0
+      ? `处理下一条（剩 ${pendingQueue.value.length}）`
+      : "开始逐条处理";
+  }
+  return mrQueue.value.length > 1
+    ? `申请 MR（剩 ${mrQueue.value.length}）`
+    : "申请 MR";
+});
+
+const nextActionHint = computed(() => {
+  if (pendingQueue.value.length > 0) {
+    const next = pendingQueue.value[0];
+    return `去预演并解决：${next.from} → ${next.into}`;
+  }
+  const cell = mrCells.value[0];
+  if (!cell) {
+    return "";
+  }
+  const source = stageOf(cell) === "ready" ? cell.from : tempBranchFor(cell)?.name;
+  return `用 ${source} 申请 MR：${cell.from} → ${cell.into}`;
+});
+
+function goPreviewActive(): void {
+  const cell = activeCell.value;
+  if (cell) {
+    goPreview({ into: cell.into, from: cell.from });
+  }
+}
+
+const activeProgress = computed(() =>
+  activeCell.value ? progressFor(activeCell.value) : undefined,
+);
+const activeStage = computed<Stage>(() =>
+  activeCell.value ? stageOf(activeCell.value) : "open",
+);
+const activeTemp = computed(() =>
+  activeCell.value ? tempBranchFor(activeCell.value) : undefined,
+);
+const activeMrUrl = computed(() => activeProgress.value?.mr?.url ?? "");
+
+function createMrActive(): void {
+  if (activeCell.value) {
+    createMrFor(activeCell.value);
+  }
+}
+
+const summary = computed(() => {
+  const cells = props.survey?.cells ?? [];
+  return {
+    total: cells.length,
+    clean: cells.filter((c) => c.outcome === "clean").length,
+    conflicts: cells.filter((c) => c.outcome === "conflicts").length,
+    files: new Set(cells.flatMap((c) => c.conflictPaths)).size,
+  };
+});
+
+/** 批量后参与清理的本地临时分支（含矩阵外已解决的） */
+const batchCleanupBranches = computed(() =>
+  allCells.value
+    .filter((c) => ["local", "resolved"].includes(stageOf(c)))
+    .map((c) => tempBranchFor(c)?.name)
+    .filter((b): b is string => !!b),
+);
+
+const batchInto = computed(
+  () => (resultIntos.value.length === 1 ? resultIntos.value[0] : "") ?? "",
+);
+
+/**
+ * 「一键处理合并并推送」启用条件：单 into；参与批量的格子（排除已提 MR / 开过
+ * 创建页的）全部就绪——冲突格已解决（本地或已推均可），干净格本来就是 ready。
+ */
+const canBatch = computed(() => {
+  if (props.busy || !props.survey) {
+    return false;
+  }
+  if (resultIntos.value.length !== 1) {
+    return false;
+  }
+  const cells = allCells.value;
+  if (cells.length === 0) {
+    return false;
+  }
+  const inBatch = cells.filter((c) => !["mr", "page"].includes(stageOf(c)));
+  if (inBatch.length === 0) {
+    return false;
+  }
+  return inBatch.every((c) => {
+    const stage = stageOf(c);
+    return stage === "ready" || stage === "local" || stage === "resolved";
+  });
+});
+
+const batchHint = computed(() => {
+  if (canBatch.value) {
+    return "干跑预演后确认执行：worktree 累积合并 + 单次推送，产出单个总 MR 的批量分支";
+  }
+  if (resultIntos.value.length !== 1) {
+    return "批量合并需要唯一的线上目标";
+  }
+  const open = allCells.value.filter((c) => stageOf(c) === "open").length;
+  if (open > 0) {
+    return `还有 ${open} 组冲突未解决，先逐条处理`;
+  }
+  return "没有可批量处理的格子";
+});
+
+/** 统计行的顺序 pill：建议顺序可连续干净合入 X / N（原顺序 Y） */
+const orderPill = computed(() => {
+  const o = props.order;
+  if (!o || !orderMatches.value) {
+    return null;
+  }
+  return {
+    cleanPrefix: o.best.cleanPrefix,
+    total: o.best.order.length,
+    baseline: o.baseline.cleanPrefix,
+    improved: o.best.cleanPrefix > o.baseline.cleanPrefix,
+  };
+});
+
+function shortRef(name: string): string {
+  return name.length > 28 ? `…${name.slice(-27)}` : name;
+}
+
+watch(
+  () => props.survey,
+  () => {
+    activeCell.value = null;
+  },
+);
+</script>
+
+<template>
+  <div class="matrix">
+    <div class="matrix-setup">
+      <div class="matrix-setup-row">
+        <div class="matrix-picker">
+          <div class="seg" role="group">
+            <button
+              class="seg-btn"
+              :class="{ active: picking === 'into' }"
+              type="button"
+              @click="picking = 'into'"
+            >
+              线上目标
+            </button>
+            <button
+              class="seg-btn"
+              :class="{ active: picking === 'from' }"
+              type="button"
+              @click="picking = 'from'"
+            >
+              我的分支
+            </button>
+          </div>
+          <BranchTreeSelect
+            v-model="pickValue"
+            :branches="branches"
+            :remote-only="picking === 'into'"
+            :disabled="busy"
+            :multi="true"
+            :placeholder="picking === 'into' ? '选择线上目标…' : '选择待合入分支…'"
+            @confirm="onPickedConfirm"
+          />
+        </div>
+        <div class="matrix-setup-actions">
+          <button class="btn" type="button" :disabled="!canRun" @click="runSurvey">
+            跑矩阵
+          </button>
+        </div>
+      </div>
+
+      <div class="matrix-chips">
+        <div class="matrix-chip-line">
+          <span class="matrix-chip-label mono online">INTO</span>
+          <span v-if="intos.length === 0" class="hint">未选</span>
+          <button
+            v-for="b in intos"
+            :key="`i-${b}`"
+            class="chip chip--online"
+            type="button"
+            title="移除"
+            @click="drop('into', b)"
+          >
+            {{ shortRef(b) }}<span class="chip-x" aria-hidden="true">×</span>
+          </button>
+        </div>
+        <div class="matrix-chip-line">
+          <span class="matrix-chip-label mono mine">FROM</span>
+          <span v-if="froms.length === 0" class="hint">未选</span>
+          <button
+            v-for="b in froms"
+            :key="`f-${b}`"
+            class="chip chip--mine"
+            type="button"
+            title="移除"
+            @click="drop('from', b)"
+          >
+            {{ shortRef(b) }}<span class="chip-x" aria-hidden="true">×</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="survey" class="matrix-body">
+      <!-- 批量结果横幅：实跑成功后常驻，直到清理或重跑矩阵 -->
+      <div v-if="batchResult" class="batch-banner" :class="{ 'batch-banner--warn': !batchResult.pushed }">
+        <div class="batch-banner-name mono">{{ batchResult.batchBranch }}</div>
+        <div class="batch-banner-msg">
+          已合并 {{ batchResult.steps.filter((s) => s.outcome === "merged").length }} 个分支，
+          提交 {{ batchResult.commitSha ? batchResult.commitSha.slice(0, 7) : "" }}。
+          <template v-if="batchResult.pushed">已推送，可申请总 MR。</template>
+          <template v-else>推送失败：{{ batchResult.pushError || "未知原因" }}，可重推。</template>
+        </div>
+        <button
+          v-if="batchResult.pushed"
+          class="btn"
+          type="button"
+          :disabled="busy"
+          @click="emit('batchMr', { into: batchResult.into, batchBranch: batchResult.batchBranch })"
+        >
+          一键申请 MR
+        </button>
+        <button
+          v-else
+          class="btn"
+          type="button"
+          :disabled="busy"
+          @click="emit('batchPush', { into: batchResult.into, batchBranch: batchResult.batchBranch })"
+        >
+          重推
+        </button>
+        <button
+          class="btn secondary"
+          type="button"
+          :disabled="busy"
+          title="删除批量分支与本地临时分支（MR 合入后再清理）"
+          @click="emit('batchCleanup', { into: batchInto, branches: [batchResult.batchBranch, ...batchCleanupBranches] })"
+        >
+          清理
+        </button>
+      </div>
+      <div class="matrix-grid-wrap">
+        <div class="matrix-stats">
+          <span class="stat-pill" :class="summary.conflicts === 0 ? 'ok' : 'warn'">
+            <strong>{{ summary.clean }}</strong> / {{ summary.total }} 干净
+          </span>
+          <span v-if="summary.conflicts > 0" class="stat-pill warn">
+            <strong>{{ summary.conflicts }}</strong> 组冲突
+          </span>
+          <span v-if="doneCount > 0" class="stat-pill ok" title="已产出临时分支">
+            已处理 <strong>{{ doneCount }}</strong>
+          </span>
+          <span v-if="mrDoneCount > 0" class="stat-pill ok">
+            已提 MR <strong>{{ mrDoneCount }}</strong>
+          </span>
+          <span v-if="summary.files > 0" class="stat-pill">
+            涉及 <strong>{{ summary.files }}</strong> 个文件
+          </span>
+          <span class="stat-pill">{{ survey.fetched ? "已 fetch" : "未 fetch" }}</span>
+          <button
+            v-if="pendingQueue.length > 0 || mrQueue.length > 0"
+            class="btn"
+            type="button"
+            :disabled="busy"
+            :title="nextActionHint"
+            @click="nextAction"
+          >
+            {{ nextActionText }}
+          </button>
+          <!-- 算顺序：常驻统计行，位于逐条处理按钮右侧；排序结果直接重排下方矩阵行 -->
+          <button
+            class="btn secondary"
+            type="button"
+            :disabled="!canOrder"
+            :title="
+              canOrder ? '推演最佳合入顺序，并按建议顺序重排下方矩阵' : '需要 1 个线上目标 + 2 个以上我的分支'
+            "
+            @click="runOrder"
+          >
+            算顺序
+          </button>
+          <!-- 一键处理合并并推送：干跑预演 → 确认清单 → worktree 累积合并 + 单次推送 -->
+          <button
+            class="btn"
+            type="button"
+            :disabled="!canBatch"
+            :title="batchHint"
+            @click="startBatch"
+          >
+            一键处理合并并推送
+          </button>
+          <template v-if="orderPill">
+            <span
+              class="stat-pill"
+              :class="orderPill.improved ? 'ok' : ''"
+              title="按建议顺序从头连续合入的干净步数"
+            >
+              建议顺序可干净合入
+              <strong>{{ orderPill.cleanPrefix }}</strong> / {{ orderPill.total }}
+              <template v-if="orderPill.improved">
+                （原顺序 {{ orderPill.baseline }}）
+              </template>
+            </span>
+            <div class="seg matrix-order-view" role="group" title="切换矩阵行序">
+              <button
+                class="seg-btn"
+                type="button"
+                :class="{ active: orderView === 'best' }"
+                @click="orderView = 'best'"
+              >
+                建议顺序
+              </button>
+              <button
+                class="seg-btn"
+                type="button"
+                :class="{ active: orderView === 'original' }"
+                @click="orderView = 'original'"
+              >
+                原顺序
+              </button>
+            </div>
+          </template>
+        </div>
+
+        <div class="matrix-scroll">
+          <table class="matrix-table">
+            <thead>
+              <tr>
+                <th class="matrix-corner mono">FROM \ INTO</th>
+                <th v-for="i in resultIntos" :key="i" class="matrix-col-head" :title="i">
+                  {{ shortRef(i) }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <template
+                v-for="row in displayRows"
+                :key="row.kind === 'row' ? row.from : 'divider'"
+              >
+                <tr v-if="row.kind === 'row'">
+                  <th class="matrix-row-head" :title="row.from">
+                    <span
+                      v-if="row.ord > 0"
+                      class="matrix-row-ord mono"
+                      title="建议合入次序"
+                    >
+                      {{ row.ord }}
+                    </span>
+                    {{ shortRef(row.from) }}
+                  </th>
+                  <td v-for="c in row.cells" :key="c.into" class="matrix-td">
+                    <button
+                      v-if="c.cell"
+                      class="matrix-cell"
+                      :class="[`matrix-cell--${c.cell.outcome}`, stageClass(c.cell)]"
+                      type="button"
+                      :title="cellTitle(c.cell)"
+                      @click="activeCell = c.cell"
+                    >
+                      <span class="matrix-cell-text">
+                        {{ STAGE_TEXT[stageOf(c.cell)] || OUTCOME_TEXT[c.cell.outcome] }}
+                      </span>
+                      <span v-if="stageMark(c.cell)" class="matrix-cell-n" aria-hidden="true">
+                        {{ stageMark(c.cell) }}
+                      </span>
+                      <span v-else-if="c.cell.conflictPaths.length > 0" class="matrix-cell-n">
+                        {{ c.cell.conflictPaths.length }}
+                      </span>
+                    </button>
+                  </td>
+                </tr>
+                <tr v-else class="matrix-divider-row">
+                  <td
+                    class="matrix-divider"
+                    :colspan="resultIntos.length + 1"
+                    :title="row.reason"
+                  >
+                    ── 以下需要人工处理 ──
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <aside class="matrix-detail">
+        <template v-if="activeCell">
+          <h4 class="matrix-detail-title mono">
+            <span class="mine">{{ shortRef(activeCell.from) }}</span>
+            <span class="matrix-detail-arrow" aria-hidden="true">→</span>
+            <span class="online">{{ shortRef(activeCell.into) }}</span>
+          </h4>
+          <p class="hint">
+            {{ OUTCOME_TEXT[activeCell.outcome] }}
+            <template v-if="activeCell.conflictPaths.length > 0">
+              · {{ activeCell.conflictPaths.length }} 个文件
+            </template>
+          </p>
+          <p v-if="activeCell.error" class="hint hint--danger">{{ activeCell.error }}</p>
+
+          <!-- 干净且还没提过：这一格不用解决，直接就能提 MR -->
+          <div v-if="activeStage === 'ready'" class="matrix-done">
+            <p class="hint">
+              这一对能干净合入，不用解决冲突，直接用
+              <code>{{ shortRef(activeCell.from) }}</code> 提 MR 就行。
+            </p>
+            <button class="btn" type="button" :disabled="busy" @click="createMrActive">
+              申请 MR
+            </button>
+          </div>
+
+          <div v-else-if="activeStage !== 'open'" class="matrix-done">
+            <span class="stat-pill ok">{{ STAGE_TEXT[activeStage] }}</span>
+            <p v-if="activeTemp" class="hint">
+              临时分支 <code>{{ activeTemp.name }}</code>
+              {{ activeTemp.pushed ? "已推送。" : "只存在于本地。" }}
+            </p>
+
+            <!-- 矩阵模式下解决不推送：这条本地分支是解决记录的载体，批量流程会自动带上 -->
+            <template v-if="activeStage === 'local'">
+              <p class="hint">
+                已解决，保留在本地。「一键处理合并并推送」会自动带上它；
+                或自己 <code>git push</code> 后再单独提 MR。
+              </p>
+            </template>
+            <template v-else-if="activeStage === 'resolved'">
+              <p class="hint">
+                <template v-if="activeTemp && !activeTemp.fresh">
+                  这条分支是之前留下的，不保证基于两侧最新提交；拿不准就先「再看一遍预演」重解一次。
+                </template>
+                <template v-else>下一步：用这条临时分支申请 MR。</template>
+              </p>
+              <button class="btn" type="button" :disabled="busy" @click="createMrActive">
+                申请 MR
+              </button>
+            </template>
+            <template v-else>
+              <p class="hint">
+                {{
+                  activeStage === "page"
+                    ? "创建页已打开，请确认是否已在浏览器里提交。"
+                    : "MR 已创建。"
+                }}
+              </p>
+              <button
+                v-if="activeMrUrl"
+                class="btn secondary"
+                type="button"
+                @click="emit('openUrl', activeMrUrl)"
+              >
+                {{ activeStage === "page" ? "重新打开创建页" : "打开 MR" }}
+              </button>
+            </template>
+
+            <p v-if="activeCell.outcome === 'conflicts'" class="hint">
+              这一格底下仍是冲突：一键解决改的是临时分支，<code>{{
+                shortRef(activeCell.from)
+              }}</code>
+              本身没动，要等 MR 合入、重跑矩阵才会变干净。
+            </p>
+          </div>
+
+          <ul v-if="activeCell.conflictPaths.length > 0" class="matrix-paths">
+            <li v-for="p in activeCell.conflictPaths" :key="p" :title="p">{{ p }}</li>
+          </ul>
+          <button
+            v-if="activeCell.outcome === 'conflicts'"
+            class="btn secondary"
+            type="button"
+            @click="goPreviewActive"
+          >
+            {{ activeTemp ? "再看一遍预演" : "去完整预演" }}
+          </button>
+        </template>
+
+        <p v-else class="hint">点格子看冲突文件与处理进度。</p>
+      </aside>
+    </div>
+
+    <div v-else class="empty empty--fill">
+      选好线上目标与我的分支，点「跑矩阵」一次看完所有组合。
+    </div>
+  </div>
+</template>
