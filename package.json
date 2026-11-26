@@ -13,7 +13,12 @@
     "package:vsix": "pnpm --filter @shaohui_jin/git-insight-core build && pnpm --filter git-insight package:vsix",
     "publish:ovsx": "pnpm --filter @shaohui_jin/git-insight-core build && pnpm --filter git-insight publish:ovsx",
     "git-insight": "pnpm --filter @shaohui_jin/git-insight-core exec node dist/cli.js",
-    "test": "pnpm --filter @shaohui_jin/git-insight-core run test"
+    "test": "pnpm --filter @shaohui_jin/git-insight-core run test",
+    "test:hooks": "node --test scripts/hooks/*.test.mjs",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7"
   },
   "engines": {
     "node": ">=20"
